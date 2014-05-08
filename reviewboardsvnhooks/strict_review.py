@@ -17,17 +17,7 @@ except ImportError:
 
 from urlparse import urljoin
 
-from .utils import get_cmd_output, split
-
-def get_os_conf_dir():
-    platform = sys.platform
-    if platform.startswith('win'):
-        try:
-            return os.environ['ALLUSERSPROFILE']
-        except KeyError:
-            print >>sys.stderr, 'Unspported operation system:%s'%platform
-            sys.exit(1)
-    return '/etc'
+from utils import get_cmd_output, split
 
 def get_os_temp_dir():
     import tempfile
@@ -36,41 +26,44 @@ def get_os_temp_dir():
 def get_os_log_dir():
     platform = sys.platform
     if platform.startswith('win'):
-        return get_os_conf_dir()
+        try:
+            return os.environ['ALLUSERSPROFILE']
+        except KeyError:
+            print >>sys.stderr, 'Unspported operation system:%s'%platform
+            sys.exit(1)
     return '/var/log'
-
-OS_CONF_DIR = get_os_conf_dir()
-
-conf = ConfigParser.ConfigParser()
-
-conf_file = os.path.join(OS_CONF_DIR, 'reviewboard-svn-hooks', 'conf.ini')
-if not conf.read(conf_file):
-    raise StandardError('invalid configuration file:%s'%conf_file)
-
-
-COOKIE_FILE = os.path.join(get_os_temp_dir(), 'reviewboard-svn-hooks-cookies.txt')
-
-DEBUG = conf.getint('common', 'debug')
-
+DEBUG = False
 def debug(s):
     if not DEBUG:
         return
     f = open(os.path.join(get_os_log_dir(), 'reviewboard-svn-hooks', 'debug.log'), 'at')
     print >>f, str(datetime.datetime.now()), s
     f.close()
+class Conf(object):
+""" Read the configuration file of reviewboard svn hook. """
+    def read_conf_file(self, filename): 
+        conf = ConfigParser.ConfigParser()
 
-RB_SERVER = conf.get('reviewboard', 'url')
-USERNAME = conf.get('reviewboard', 'username')
-PASSWORD = conf.get('reviewboard', 'password')
+        if not conf.read(filename):
+            raise StandardError('invalid configuration file:%s'%filename)
 
-MIN_SHIP_IT_COUNT = conf.getint('rule', 'min_ship_it_count')
-MIN_EXPERT_SHIP_IT_COUNT = conf.getint('rule', 'min_expert_ship_it_count')
-experts = conf.get('rule', 'experts')
-EXPERTS = split(experts)
-review_path = conf.get('rule', 'review_path')
-REVIEW_PATH = split(review_path)
-ignore_path = conf.get('rule', 'ignore_path')
-IGNORE_PATH = split(ignore_path)
+        self.COOKIE_FILE = conf.get('common', 'reviewboard_cookie_file')
+        DEBUG = conf.getint('common', 'debug')
+        self.REVIEWED_ID_DB_FILE = conf.get('common', 'reviewed_id_db_file')
+
+        self.RB_SERVER = conf.get('reviewboard', 'url')
+        self.USERNAME = conf.get('reviewboard', 'username')
+        self.PASSWORD = conf.get('reviewboard', 'password')
+        
+        self.MIN_SHIP_IT_COUNT = conf.getint('rule', 'min_ship_it_count')
+        self.MIN_EXPERT_SHIP_IT_COUNT = conf.getint('rule', 'min_expert_ship_it_count')
+        experts = conf.get('rule', 'experts')
+        self.EXPERTS = split(experts)
+        review_path = conf.get('rule', 'review_path')
+        self.REVIEW_PATH = split(review_path)
+        ignore_path = conf.get('rule', 'ignore_path')
+        self.IGNORE_PATH = split(ignore_path)
+        
 
 class SvnError(StandardError):
     pass
@@ -87,6 +80,7 @@ class Opener(object):
 
     def open(self, path, ext_headers, *a, **k):
         url = urljoin(self._server, path)
+        debug("Opener open url:"+url)
         return self.abs_open(url, ext_headers, *a, **k)
 
     def abs_open(self, url, ext_headers, *a, **k):
@@ -115,28 +109,27 @@ def make_svnlook_cmd(directive, repos, txn):
 def get_review_id(repos, txn):
     svnlook = make_svnlook_cmd('log', repos, txn)
     log = get_cmd_output(svnlook)
-    debug(log)
+    debug("get_review_id:"+log)
     rid = re.search(r'review:([0-9]+)', log, re.M | re.I)
     if rid:
         return rid.group(1)
     raise SvnError('No review id.')
 
-def add_to_rid_db(rid):
-    USED_RID_DB = shelve.open(os.path.join(get_os_conf_dir(),
-        'reviewboard-svn-hooks',
-        'rb-svn-hooks-used-rid.db'))
+def add_to_rid_db(rid, id_db_filename):
+    USED_RID_DB = shelve.open(id_db_filename)
     if USED_RID_DB.has_key(rid):
         raise SvnError, "review-id(%s) is already used."%rid
     USED_RID_DB[rid] = rid
     USED_RID_DB.sync()
     USED_RID_DB.close()
 
-def check_rb(repos, txn):
+def check_rb(repos, txn, conf):
     rid = get_review_id(repos, txn)
     path = 'api/review-requests/' + str(rid) + '/reviews/'
-    opener = Opener(RB_SERVER, USERNAME, PASSWORD)
+    opener = Opener(conf.RB_SERVER, conf.USERNAME, conf.PASSWORD)
     rsp = opener.open(path, {})
     reviews = json.loads(rsp)
+    debug("check_rb get rsp:"+str(reviews))
     if reviews['stat'] != 'ok':
         raise SvnError, "get reviews error."
     ship_it_users = set()
@@ -149,13 +142,13 @@ def check_rb(repos, txn):
         raise SvnError, "not enough of ship_it."
     expert_count = 0
     for user in ship_it_users:
-        if user in EXPERTS:
+        if user in conf.EXPERTS:
             expert_count += 1
-    if expert_count < MIN_EXPERT_SHIP_IT_COUNT:
+    if expert_count < conf.MIN_EXPERT_SHIP_IT_COUNT:
         raise SvnError, 'not enough of key user ship_it.'
-    add_to_rid_db(rid)
+    add_to_rid_db(rid, conf.REVIEWED_ID_DB_FILE)
 
-def is_ignorable(changed):
+def is_ignorable(changed, IGNORE_PATH):
     for line in changed.split('\n'):
         if not line.strip():
             continue
@@ -173,15 +166,22 @@ def _main():
     debug('command:' + str(sys.argv))
     repos = sys.argv[1]
     txn = sys.argv[2]
+    conf_filename = sys.argv[3]
+    
+    # read the configuration file.
+    Conf conf;
+    conf.read(conf_filename)
 
     svnlook = make_svnlook_cmd('changed', repos, txn)
     changed = get_cmd_output(svnlook)
-    debug(changed)
+    debug("main: "+changed)
 
-    if is_ignorable(changed):
+    if is_ignorable(changed, conf.IGNORE_PATH):
+        debug("All commit is ignorabled.")
         return
 
-    if not REVIEW_PATH:
+    if not conf.REVIEW_PATH:
+        debug("not REVIEW_PATH return true")
         check_rb(repos, txn)
         return 
 
@@ -189,16 +189,20 @@ def _main():
         f = line[4:]
         for review_path in REVIEW_PATH:
             if review_path in f:
+                debug("Find ["+review_path +"] in line:"+f)
                 check_rb(repos, txn)
                 return
 
-def main():
+#def main():
+if __name__ == '__main__':
     try:
         _main()
     except SvnError, e:
+        debug("SvnError exception:"+str(e))
         print >> sys.stderr, str(e)
         exit(1)
     except Exception, e:
+        debug("Exception:"+str(e))
         print >> sys.stderr, str(e)
         import traceback
         traceback.print_exc(file=sys.stderr)
